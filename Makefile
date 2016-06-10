@@ -1,3 +1,5 @@
+#CEZARY KOSKO 337256
+
 CC      = mpicc
 CFLAGS  = -Wall -c --std=c99 -O3
 LDFLAGS = -Wall -O3 --std=c99
