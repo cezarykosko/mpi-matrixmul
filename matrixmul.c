@@ -11,7 +11,12 @@
 #define LEFT (shift_procs + shift_rank - 1) % shift_procs
 #define RIGHT (shift_procs + shift_rank + 1) % shift_procs
 
-#define MIN(A,B) A > B ? B : A
+#define Q_LEFT (shift_procs + shift_rank + repl_rank * q) % shift_procs
+#define Q_RIGHT (shift_procs + shift_rank - repl_rank * q) % shift_procs
+
+#define NPROCS use_inner ? shift_procs : num_processes
+
+#define MIN(A, B) A > B ? B : A
 
 #define INIT_SIZE_MSG 0
 #define INIT_ARR_MSG 1
@@ -52,10 +57,10 @@ void free_arr(double **c_arr, int rows) {
 }
 
 double **c_arr(int rows, int partition_size) {
-    double **res = (double **) calloc(rows, sizeof(double *));
-    f(i, 0, rows) {
-        res[i] = (double *) calloc(partition_size, sizeof(double));
-        f(j, 0, partition_size) {
+    double **res = (double **) calloc(partition_size, sizeof(double *));
+    f(i, 0, partition_size) {
+        res[i] = (double *) calloc(rows, sizeof(double));
+        f(j, 0, rows) {
             res[i][j] = 0;
         }
     }
@@ -63,11 +68,11 @@ double **c_arr(int rows, int partition_size) {
 }
 
 double **b_arr(int my_width, int rows, int gen_seed, int partition_size, int rank) {
-    double **res = (double **) calloc(my_width, sizeof(double *));
-    f(i, 0, my_width) {
-        res[i] = (double *) calloc(rows, sizeof(double));
-        f(j, 0, rows) {
-            res[i][j] = generate_double(gen_seed, j, i + rank * partition_size);
+    double **res = (double **) calloc(rows, sizeof(double *));
+    f(i, 0, rows) {
+        res[i] = (double *) calloc(my_width, sizeof(double));
+        f(j, 0, my_width) {
+            res[i][j] = generate_double(gen_seed, i, j + rank * partition_size);
         }
     }
     return res;
@@ -128,6 +133,9 @@ int main(int argc, char *argv[]) {
 
     int repl_rank = 0;
     int repl_procs = 0;
+
+    int res_rank = 0;
+    int res_procs = 0;
 
     sparse_type sparse = NULL;
 
@@ -256,7 +264,7 @@ int main(int argc, char *argv[]) {
     MPI_Allgather(&my_size, 1, MPI_INT, part_sizes, 1, MPI_INT, repl_comm);
     displs[0] = 0;
     f(i, 1, repl_procs) {
-        displs[i] = displs[i-1] + part_sizes[i-1];
+        displs[i] = displs[i - 1] + part_sizes[i - 1];
     }
     res_size = displs[repl_procs - 1] + part_sizes[repl_procs - 1];
 
@@ -266,8 +274,33 @@ int main(int argc, char *argv[]) {
 
     MPI_Allgatherv(mycols, my_size, coo_type, res_coos, part_sizes, displs, coo_type, repl_comm);
 
-    double **B = b_arr(my_width, rows, gen_seed, partition_size, mpi_rank);
-    double **C = c_arr(my_width, rows);
+    // only useful when use_inner
+    int *widths;
+    int sum_widths;
+
+    double **B;
+    if (!use_inner) {
+        B = b_arr(my_width, rows, gen_seed, partition_size, mpi_rank);
+        sum_widths = my_width;
+    } else {
+        double **myB = b_arr(my_width, rows, gen_seed, partition_size, mpi_rank);
+        widths = (int *) malloc(sizeof(int) * repl_procs);
+        displs = (int *) malloc(sizeof(int) * repl_procs);
+        MPI_Allgather(&my_width, 1, MPI_INT, widths, 1, MPI_INT, repl_comm);
+        displs[0] = 0;
+        f(i, 1, repl_procs) {
+            displs[i] = displs[i - 1] + widths[i - 1];
+        }
+        sum_widths = displs[repl_procs - 1] + widths[repl_procs - 1];
+        B = (double **) calloc(rows, sizeof(double *));
+        MPI_Barrier(repl_comm);
+        f(i, 0, rows) {
+            B[i] = (double *) calloc(sum_widths, sizeof(double));
+            MPI_Allgatherv(myB[i], my_width, MPI_DOUBLE, B[i], widths, displs, MPI_DOUBLE, repl_comm);
+        }
+
+    }
+    double **C = c_arr(sum_widths, rows);
 
     MPI_Barrier(MPI_COMM_WORLD);
     comm_end = MPI_Wtime();
@@ -276,12 +309,38 @@ int main(int argc, char *argv[]) {
     comp_start = MPI_Wtime();
     int curr_size = res_size;
     coo *curr_coos = res_coos;
+    int p_c = repl_procs;
+    int q = p_c / repl_fact;
+
+    if (use_inner) {
+        MPI_Barrier(shift_comm);
+        MPI_Request requests[2];
+        MPI_Isend(&curr_size, 1, MPI_INT, Q_LEFT, SHIFT_SIZE_MSG,
+                  shift_comm, requests + 0);
+        MPI_Isend(curr_coos, curr_size, coo_type, Q_LEFT, SHIFT_MSG,
+                  shift_comm, requests + 1);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        coo *temp_coos;
+        int temp_size;
+        MPI_Status statuses[2];
+        MPI_Recv(&temp_size, 1, MPI_INT, Q_RIGHT, SHIFT_SIZE_MSG, shift_comm, statuses + 0);
+        temp_coos = (coo *) malloc(sizeof(coo) * temp_size);
+        MPI_Recv(temp_coos, temp_size, coo_type, Q_RIGHT, SHIFT_MSG, shift_comm, statuses + 1);
+        MPI_Barrier(shift_comm);
+
+        curr_size = temp_size;
+        free(curr_coos);
+        curr_coos = temp_coos;
+    }
+
+    int round_length = use_inner ? q : shift_procs;
     f(i, 0, exponent) {
-        f(iter, 0, shift_procs) {
+        f(iter, 0, round_length) {
             f(c_ix, 0, curr_size) {
                 coo tmp = curr_coos[c_ix];
-                f(r_ix, 0, my_width) {
-                    C[r_ix][tmp.row] += B[r_ix][tmp.col] * tmp.val;
+                f(r_ix, 0, sum_widths) {
+                    C[tmp.row][r_ix] += B[tmp.col][r_ix] * tmp.val;
                 }
             }
 
@@ -304,10 +363,23 @@ int main(int argc, char *argv[]) {
             curr_coos = temp_coos;
         }
 
-        f(r_ix, 0, my_width) {
-            f(c_ix, 0, rows) {
-                B[r_ix][c_ix] = C[r_ix][c_ix];
-                C[r_ix][c_ix] = 0;
+        if (use_inner) { // gather partial Cs
+            MPI_Barrier(repl_comm);
+            f(i, 0, rows) {
+                MPI_Allreduce(C[i], B[i], sum_widths, MPI_DOUBLE, MPI_SUM, repl_comm);
+                MPI_Barrier(repl_comm);
+                f(j, 0, sum_widths) {
+                    C[i][j] = 0;
+                }
+            }
+
+        } else {
+
+            f(r_ix, 0, my_width) {
+                f(c_ix, 0, rows) {
+                    B[c_ix][r_ix] = C[c_ix][r_ix];
+                    C[c_ix][r_ix] = 0;
+                }
             }
         }
     }
@@ -318,20 +390,20 @@ int main(int argc, char *argv[]) {
         int *widths = (int *) malloc(sizeof(int) * num_processes);
         displs = (int *) malloc(sizeof(int) * num_processes);
         double *tmp_line = (double *) malloc(sizeof(double) * my_width);
-        double *line = (double *)malloc(sizeof(double) * rows);
-        MPI_Gather(&my_width, 1, MPI_INT, widths, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        double *line = (double *) malloc(sizeof(double) * rows);
+        if (use_inner && repl_rank != 0) {
+            sum_widths = 0;
+        }
+        MPI_Gather(&sum_widths, 1, MPI_INT, widths, 1, MPI_INT, 0, MPI_COMM_WORLD);
         displs[0] = 0;
         f(i, 1, num_processes) {
-            displs[i] = displs[i-1] + widths[i-1];
+            displs[i] = displs[i - 1] + widths[i - 1];
         }
         if (mpi_rank == 0) {
             printf("%d %d\n", rows, rows);
         }
         f(i, 0, rows) {
-            f(k, 0, my_width) {
-                tmp_line[k] = B[k][i];
-            }
-            MPI_Gatherv(tmp_line, my_width, MPI_DOUBLE, line, widths, displs, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+            MPI_Gatherv(B[i], sum_widths, MPI_DOUBLE, line, widths, displs, MPI_DOUBLE, 0, MPI_COMM_WORLD);
             if (mpi_rank == 0) {
                 f(j, 0, rows) {
                     printf("%f\t", line[j]);
@@ -345,21 +417,24 @@ int main(int argc, char *argv[]) {
         free(line);
     }
     if (count_ge) {
-        int all_counts = 0;
-        int proc_count = 0;
+        long all_counts = 0;
+        long proc_count = 0;
         f(i, 0, rows) {
-            f(j, 0, my_width) {
-                if (B[j][i] > ge_element) {
+            f(j, 0, sum_widths) {
+                if (B[i][j] >= ge_element) {
                     proc_count++;
                 }
             }
         }
+        if (use_inner && repl_rank != 0) {
+            proc_count = 0;
+        }
         MPI_Barrier(MPI_COMM_WORLD);
 
-        MPI_Reduce(&proc_count, &all_counts, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&proc_count, &all_counts, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
         if (mpi_rank == 0) {
-            printf("%d\n", all_counts);
+            printf("%ld\n", all_counts);
         }
     }
 
