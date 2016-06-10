@@ -6,6 +6,8 @@
 
 #include "densematgen.h"
 
+// CEZARY KOSKO 337256
+
 #define f(I, IX, M) for (int I = IX; I < M; I++)
 
 #define LEFT (shift_procs + shift_rank - 1) % shift_procs
@@ -47,13 +49,6 @@ int cmpcols(const void *a, const void *b) {
     int b_col = ((coo *) b)->col;
 
     return a_col - b_col;
-}
-
-void free_arr(double **c_arr, int rows) {
-    f(i, 0, rows) {
-        free(c_arr[rows]);
-    }
-    free(c_arr);
 }
 
 double **c_arr(int rows, int partition_size) {
@@ -133,9 +128,6 @@ int main(int argc, char *argv[]) {
 
     int repl_rank = 0;
     int repl_procs = 0;
-
-    int res_rank = 0;
-    int res_procs = 0;
 
     sparse_type sparse = NULL;
 
@@ -312,7 +304,7 @@ int main(int argc, char *argv[]) {
     int p_c = num_processes / repl_fact;
     int q = p_c / repl_fact;
 
-    if (use_inner) {
+    if (use_inner) { // for the inner algorithm we only need to do the initial shift once
         MPI_Barrier(shift_comm);
         MPI_Request requests[2];
         MPI_Isend(&curr_size, 1, MPI_INT, Q_LEFT, SHIFT_SIZE_MSG,
@@ -389,7 +381,6 @@ int main(int argc, char *argv[]) {
     if (show_results) {
         int *widths = (int *) malloc(sizeof(int) * num_processes);
         displs = (int *) malloc(sizeof(int) * num_processes);
-        double *tmp_line = (double *) malloc(sizeof(double) * my_width);
         double *line = (double *) malloc(sizeof(double) * rows);
         if (use_inner && repl_rank != 0) {
             sum_widths = 0;
@@ -413,25 +404,23 @@ int main(int argc, char *argv[]) {
         }
         free(widths);
         free(displs);
-        free(tmp_line);
         free(line);
     }
     if (count_ge) {
         long all_counts = 0;
         long proc_count = 0;
-        f(i, 0, rows) {
-            f(j, 0, sum_widths) {
-                if (B[i][j] >= ge_element) {
-                    proc_count++;
+        if (use_inner && repl_rank != 0) {
+            proc_count = 0;
+        }  else {
+            f(i, 0, rows) {
+                f(j, 0, sum_widths) {
+                    if (B[i][j] >= ge_element) {
+                        proc_count++;
+                    }
                 }
             }
         }
-        if (use_inner && repl_rank != 0) {
-            proc_count = 0;
-        }
         MPI_Barrier(MPI_COMM_WORLD);
-
-        printf("%d : %ld\n", mpi_rank, proc_count);
 
         MPI_Reduce(&proc_count, &all_counts, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
