@@ -309,7 +309,7 @@ int main(int argc, char *argv[]) {
     comp_start = MPI_Wtime();
     int curr_size = res_size;
     coo *curr_coos = res_coos;
-    int p_c = repl_procs;
+    int p_c = num_processes / repl_fact;
     int q = p_c / repl_fact;
 
     if (use_inner) {
@@ -430,6 +430,8 @@ int main(int argc, char *argv[]) {
             proc_count = 0;
         }
         MPI_Barrier(MPI_COMM_WORLD);
+
+        printf("%d : %ld\n", mpi_rank, proc_count);
 
         MPI_Reduce(&proc_count, &all_counts, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
