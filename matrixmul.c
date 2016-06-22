@@ -18,7 +18,8 @@
 
 #define NPROCS use_inner ? shift_procs : num_processes
 
-#define MIN(A, B) A > B ? B : A
+#define MIN(A, B) (A > B ? B : A)
+#define MAX(A, B) (A < B ? B : A)
 
 #define INIT_SIZE_MSG 0
 #define INIT_ARR_MSG 1
@@ -62,12 +63,12 @@ double **c_arr(int rows, int partition_size) {
     return res;
 }
 
-double **b_arr(int my_width, int rows, int gen_seed, int partition_size, int rank) {
+double **b_arr(int my_width, int rows, int gen_seed, int partition_size, int partition_corr, int rank) {
     double **res = (double **) calloc(rows, sizeof(double *));
     f(i, 0, rows) {
         res[i] = (double *) calloc(my_width, sizeof(double));
         f(j, 0, my_width) {
-            res[i][j] = generate_double(gen_seed, i, j + rank * partition_size);
+            res[i][j] = generate_double(gen_seed, i, j + rank * partition_size + MIN(rank, partition_corr));
         }
     }
     return res;
@@ -131,7 +132,7 @@ int main(int argc, char *argv[]) {
 
     sparse_type sparse = NULL;
 
-    int partition_size, nnzs_rows;
+    int partition_size, nnzs_rows, partition_corr;
 
     MPI_Datatype coo_type;
     MPI_Datatype type[3] = {MPI_INT, MPI_INT, MPI_DOUBLE};
@@ -210,9 +211,8 @@ int main(int argc, char *argv[]) {
     if (mpi_rank == 0) {
         rows = sparse->rows;
         partition_size =
-                sparse->rows % num_processes == 0
-                ? sparse->rows / num_processes
-                : (sparse->rows / num_processes + 1);
+                rows / num_processes;
+        partition_corr = rows % num_processes;
         coos = (coo *) malloc(sizeof(coo) * sparse->nnz);
         int j = 0, rows = sparse->rows;
         for (int i = 0; i < rows; i++) {
@@ -230,7 +230,8 @@ int main(int argc, char *argv[]) {
         f(i, 0, num_processes) {
             int tmp = 0;
             f(j, 0, sparse->nnz) {
-                if (coos[j].col >= i * partition_size && coos[j].col < (i + 1) * partition_size) {
+                if (coos[j].col >= i * partition_size + MIN(i, partition_corr)
+                    && coos[j].col < (i + 1) * partition_size + MIN((i + 1), partition_corr)) {
                     tmp++;
                 }
             }
@@ -248,6 +249,7 @@ int main(int argc, char *argv[]) {
     MPI_Scatterv(coos, part_sizes, displs, coo_type, mycols, my_size, coo_type, 0, MPI_COMM_WORLD);
 
     MPI_Bcast(&partition_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&partition_corr, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&nnzs_rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
     int res_size;
@@ -260,8 +262,7 @@ int main(int argc, char *argv[]) {
     }
     res_size = displs[repl_procs - 1] + part_sizes[repl_procs - 1];
 
-    int my_width = MIN((mpi_rank + 1) * partition_size, rows);
-    my_width -= mpi_rank * partition_size;
+    int my_width = partition_size + (mpi_rank < (partition_corr) ? 1 : 0);
     coo *res_coos = (coo *) malloc(sizeof(coo) * res_size);
 
     MPI_Allgatherv(mycols, my_size, coo_type, res_coos, part_sizes, displs, coo_type, repl_comm);
@@ -272,10 +273,10 @@ int main(int argc, char *argv[]) {
 
     double **B;
     if (!use_inner) {
-        B = b_arr(my_width, rows, gen_seed, partition_size, mpi_rank);
+        B = b_arr(my_width, rows, gen_seed, partition_size, partition_corr, mpi_rank);
         sum_widths = my_width;
     } else {
-        double **myB = b_arr(my_width, rows, gen_seed, partition_size, mpi_rank);
+        double **myB = b_arr(my_width, rows, gen_seed, partition_size, partition_corr, mpi_rank);
         widths = (int *) malloc(sizeof(int) * repl_procs);
         displs = (int *) malloc(sizeof(int) * repl_procs);
         MPI_Allgather(&my_width, 1, MPI_INT, widths, 1, MPI_INT, repl_comm);
